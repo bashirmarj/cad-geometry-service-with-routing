@@ -1,163 +1,540 @@
 """
-Unified CAD Geometry Analysis and Industrial Machining Quotation System
-Parses STEP/IGES files, detects geometry, selects machining routings, estimates cost, and generates mesh data.
-Ready for deployment on Render.com
+CAD Geometry Analysis Microservice
+Parses STEP/IGES files using pythonOCC to extract real geometry data
 """
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import tempfile, os, logging, math
+import tempfile
+import os
+import logging
 
-# OCC imports for geometry parsing
+# Import industrial routing modules
+from routing_selector_industrial import select_routings_industrial
+from machining_estimator import estimate_machining_time_and_cost
+
+# OCC imports for STEP parsing
 from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.GProp import GProp_GProps
 from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
-from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Plane
+from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Plane, GeomAbs_Circle
 from OCC.Core.TopExp import TopExp_Explorer
-from OCC.Core.TopAbs import TopAbs_FACE
-from OCC.Core.gp import gp_Pnt
+from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
+from OCC.Core.gp import gp_Pnt, gp_Vec, gp_Dir
 from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
 from OCC.Core.TopLoc import TopLoc_Location
 from OCC.Core.BRep import BRep_Tool
+import math
 
 app = Flask(__name__)
 CORS(app)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# =============================
-# ROUTING SELECTION MODULE
-# =============================
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'service': 'cad-geometry-analyzer'}), 200
 
-def select_routings_industrial(desc, material):
-    """Select manufacturing routings based on geometry, material, and tolerance"""
-    routings, reasons = [], []
-    bbox = desc.get("bounding_box", [0, 0, 0])
-    largest_dim = max(bbox) if bbox else 0
-    volume = desc.get("volume_cm3", 0)
-    complexity = desc.get("complexity_score", 5)
-    holes = desc.get("holes_count", 0)
-    grooves = desc.get("grooves_count", 0)
-    tolerance = desc.get("tolerance", 0.05)
-    is_cylindrical = desc.get("is_cylindrical", False)
-    has_flats = desc.get("has_flat_surfaces", False)
+@app.route('/analyze-cad', methods=['POST'])
+def analyze_cad():
+    """
+    Analyze STEP/IGES file geometry with industrial routing selection
+    
+    Accepts: multipart/form-data with:
+        - file: CAD file (STEP/IGES)
+        - material (optional): Material name (default: "Cold Rolled Steel")
+        - tolerance (optional): Tolerance in mm (default: 0.02)
+        - quality (optional): Mesh quality 0-1 (default: 0.999)
+    
+    Returns: JSON with geometry properties, detected features, routing recommendations, and cost estimates
+    """
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    
+    file = request.files['file']
+    if not file.filename:
+        return jsonify({'error': 'Empty filename'}), 400
+    
+    # Get material and tolerance from form data
+    material = request.form.get('material', 'Cold Rolled Steel')
+    tolerance = float(request.form.get('tolerance', 0.02))
+    
+    logger.info(f"Analyzing file: {file.filename}, material: {material}, tolerance: {tolerance}mm")
+    
+    # Save temporarily
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+        file.save(tmp.name)
+        tmp_path = tmp.name
+    
+    try:
+        # Parse STEP file
+        reader = STEPControl_Reader()
+        status = reader.ReadFile(tmp_path)
+        
+        if status != 1:  # IFSelect_RetDone
+            raise Exception(f"Failed to read STEP file, status: {status}")
+        
+        reader.TransferRoots()
+        shape = reader.OneShape()
+        
+        if shape.IsNull():
+            raise Exception("Failed to extract shape from STEP file")
+        
+        # Calculate volume
+        props = GProp_GProps()
+        brepgprop.VolumeProperties(shape, props)
+        volume_mm3 = props.Mass()
+        
+        # Calculate surface area
+        brepgprop.SurfaceProperties(shape, props)
+        surface_area_mm2 = props.Mass()
+        
+        # Get bounding box
+        bbox = Bnd_Box()
+        brepbndlib.Add(shape, bbox)
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+        
+        width_mm = xmax - xmin
+        height_mm = ymax - ymin
+        depth_mm = zmax - zmin
+        
+        # Analyze faces for feature detection
+        cylindrical_faces = 0
+        planar_faces = 0
+        total_faces = 0
+        
+        explorer = TopExp_Explorer(shape, TopAbs_FACE)
+        while explorer.More():
+            face = explorer.Current()
+            surface = BRepAdaptor_Surface(face)
+            surface_type = surface.GetType()
+            
+            if surface_type == GeomAbs_Cylinder:
+                cylindrical_faces += 1
+            elif surface_type == GeomAbs_Plane:
+                planar_faces += 1
+            
+            total_faces += 1
+            explorer.Next()
+        
+        logger.info(f"Geometry analysis: {total_faces} faces ({cylindrical_faces} cylindrical, {planar_faces} planar)")
+        
+        # Determine if cylindrical (>40% cylindrical faces)
+        is_cylindrical = cylindrical_faces > (total_faces * 0.4) if total_faces > 0 else False
+        has_flat_surfaces = planar_faces > 2
+        
+        # Complexity scoring based on face count
+        complexity = min(10, max(1, int(total_faces / 10) + 3))
+        
+        # Advanced feature detection
+        holes = detect_holes(shape)
+        grooves = detect_grooves(shape, cylindrical_faces)
+        flat_surfaces = detect_flat_surfaces_detailed(shape)
+        primary_dims = calculate_principal_dimensions(shape, (xmin, ymin, zmin, xmax, ymax, zmax), is_cylindrical)
+        
+        # Tessellate shape to extract mesh data
+        # Default quality=0.999 for professional CAD viewer quality (0.011mm deflection)
+        # This ensures perfectly smooth internal curved surfaces with no visible faceting
+        quality = float(request.form.get('quality', 0.999))  # 0-1, higher = finer mesh
+        mesh_data = tessellate_shape(shape, quality)
+        
+        # Build geometry descriptor for routing selection
+        geometry_descriptor = {
+            "volume_cm3": round(volume_mm3 / 1000, 2),
+            "bounding_box": [width_mm, height_mm, depth_mm],
+            "is_cylindrical": is_cylindrical,
+            "has_flat_surfaces": has_flat_surfaces,
+            "holes_count": len(holes),
+            "grooves_count": len(grooves),
+            "complexity_score": complexity,
+            "tolerance": tolerance
+        }
+        
+        # ===== INDUSTRIAL ROUTING SELECTION =====
+        routing_result = select_routings_industrial(geometry_descriptor, material)
+        
+        # ===== MACHINING TIME & COST ESTIMATION =====
+        machining_estimate = estimate_machining_time_and_cost(
+            geometry_descriptor,
+            material,
+            routing_result["recommended_routings"]
+        )
+        
+        # Build feature tree for advanced feature display
+        feature_tree = buildFeatureTree(holes, grooves, flat_surfaces, primary_dims, is_cylindrical, width_mm, height_mm, depth_mm)
+        
+        # Build enhanced result
+        result = {
+            'volume_cm3': round(volume_mm3 / 1000, 2),
+            'surface_area_cm2': round(surface_area_mm2 / 100, 2),
+            'part_width_cm': round(width_mm / 10, 2),
+            'part_height_cm': round(height_mm / 10, 2),
+            'part_depth_cm': round(depth_mm / 10, 2),
+            'complexity_score': complexity,
+            'is_cylindrical': is_cylindrical,
+            'has_flat_surfaces': has_flat_surfaces,
+            'cylindrical_faces': cylindrical_faces,
+            'planar_faces': planar_faces,
+            'total_faces': total_faces,
+            'confidence': 0.95,
+            'method': 'pythonOCC_geometry_parsing',
+            'detected_features': {
+                'holes': holes,
+                'grooves': grooves,
+                'flat_surfaces': flat_surfaces,
+                'primary_dimensions': primary_dims
+            },
+            'feature_tree': feature_tree,
+            'mesh_data': mesh_data,
+            # Industrial routing data
+            'recommended_routings': routing_result["recommended_routings"],
+            'routing_reasoning': routing_result["reasoning"],
+            'machining_summary': machining_estimate["machining_summary"],
+            'estimated_total_cost_usd': machining_estimate["total_cost_usd"]
+        }
+        
+        logger.info(f"Analysis complete: cylindrical={is_cylindrical}, complexity={complexity}, holes={len(holes)}, routings={routing_result['recommended_routings']}, est_cost=${machining_estimate['total_cost_usd']}")
+        return jsonify(result), 200
+        
+    except Exception as e:
+        logger.error(f"Error analyzing file: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+        
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
 
-    logger.info(f"Routing selection: cylindrical={is_cylindrical}, dim={largest_dim}mm, holes={holes}, complexity={complexity}")
+def detect_holes(shape):
+    """Detect cylindrical holes (voids) - not outer cylindrical features"""
+    holes = []
+    
+    try:
+        # Find cylindrical faces (not edges, to avoid false positives)
+        face_explorer = TopExp_Explorer(shape, TopAbs_FACE)
+        cylindrical_faces = []
+        
+        while face_explorer.More():
+            face = face_explorer.Current()
+            surface = BRepAdaptor_Surface(face)
+            
+            # Only consider cylindrical surfaces
+            if surface.GetType() == GeomAbs_Cylinder:
+                cylinder = surface.Cylinder()
+                axis = cylinder.Axis()
+                center = axis.Location()
+                direction = axis.Direction()
+                radius = cylinder.Radius()
+                
+                # Get face properties to determine if it's a hole
+                props = GProp_GProps()
+                brepgprop.SurfaceProperties(face, props)
+                area = props.Mass()
+                
+                cylindrical_faces.append({
+                    'center': (center.X(), center.Y(), center.Z()),
+                    'axis': (direction.X(), direction.Y(), direction.Z()),
+                    'radius': radius,
+                    'area': area,
+                    'face': face
+                })
+            
+            face_explorer.Next()
+        
+        # Filter to only actual holes (small radius relative to part size)
+        # Get bounding box to determine part size
+        bbox = Bnd_Box()
+        brepbndlib.Add(shape, bbox)
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+        max_dimension = max(xmax - xmin, ymax - ymin, zmax - zmin)
+        
+        # Group cylindrical faces by axis and position
+        processed = set()
+        for i, cyl1 in enumerate(cylindrical_faces):
+            if i in processed:
+                continue
+            
+            # Only consider features smaller than 1/3 of the part size as potential holes
+            if cyl1['radius'] > max_dimension / 3:
+                processed.add(i)
+                continue
+            
+            hole_faces = [cyl1]
+            
+            # Find paired cylindrical faces (same axis, similar radius)
+            for j, cyl2 in enumerate(cylindrical_faces):
+                if j <= i or j in processed:
+                    continue
+                
+                # Check if axes are parallel
+                axis_dot = sum(a*b for a,b in zip(cyl1['axis'], cyl2['axis']))
+                if abs(abs(axis_dot) - 1.0) < 0.1:  # Nearly parallel
+                    # Check if radii are similar (within 10%)
+                    if abs(cyl1['radius'] - cyl2['radius']) < cyl1['radius'] * 0.1:
+                        # Check if centers are aligned on axis
+                        center_diff = tuple(c2-c1 for c1,c2 in zip(cyl1['center'], cyl2['center']))
+                        cross_mag = sum((center_diff[i]*cyl1['axis'][j] - center_diff[j]*cyl1['axis'][i])**2 
+                                       for i,j in [(0,1), (1,2), (0,2)])
+                        
+                        if cross_mag < cyl1['radius']**2:  # Centers aligned within radius
+                            hole_faces.append(cyl2)
+                            processed.add(j)
+            
+            processed.add(i)
+            
+            # Only report as hole if we have paired faces (through hole) or single small cylinder
+            if len(hole_faces) >= 1:
+                avg_radius = sum(f['radius'] for f in hole_faces) / len(hole_faces)
+                
+                # Calculate depth
+                if len(hole_faces) >= 2:
+                    centers = [f['center'] for f in hole_faces]
+                    depth = max(math.sqrt(sum((c1[i]-c2[i])**2 for i in range(3))) 
+                               for c1 in centers for c2 in centers)
+                    through = depth > avg_radius * 3  # Through if depth > 1.5 * diameter
+                else:
+                    # Single face - likely blind hole, estimate depth from area
+                    depth = hole_faces[0]['area'] / (2 * 3.14159 * avg_radius)
+                    through = False
+                
+                # Only add if it looks like an actual hole (small relative to part)
+                if avg_radius < max_dimension / 4:  # Hole radius < 25% of part size
+                    # Classify orientation
+                    axis = hole_faces[0]['axis']
+                    abs_axis = tuple(abs(a) for a in axis)
+                    max_component = max(abs_axis)
+                    
+                    if abs(abs_axis[2] - max_component) < 0.1:
+                        orientation = 'Top+0°' if axis[2] > 0 else 'Top+180°'
+                    elif abs(abs_axis[0] - max_component) < 0.1:
+                        orientation = 'Right' if axis[0] > 0 else 'Left'
+                    else:
+                        orientation = 'Front' if axis[1] > 0 else 'Back'
+                    
+                    holes.append({
+                        'type': 'hole',
+                        'diameter_mm': round(avg_radius * 2, 2),
+                        'depth_mm': round(depth, 2),
+                        'through': through,
+                        'position': [round(hole_faces[0]['center'][i], 2) for i in range(3)],
+                        'axis': [round(axis[i], 2) for i in range(3)],
+                        'orientation': orientation
+                    })
+    
+    except Exception as e:
+        logger.error(f"Error detecting holes: {e}")
+    
+    return holes
 
-    # Cylindrical parts
+def detect_grooves(shape, cylindrical_face_count):
+    """Detect annular grooves (parallel circular cuts)"""
+    grooves = []
+    
+    if cylindrical_face_count < 2:
+        return grooves  # Need cylindrical geometry for grooves
+    
+    try:
+        # Look for pairs of cylindrical faces with different radii
+        face_explorer = TopExp_Explorer(shape, TopAbs_FACE)
+        cylindrical_surfaces = []
+        
+        while face_explorer.More():
+            face = face_explorer.Current()
+            surface = BRepAdaptor_Surface(face)
+            
+            if surface.GetType() == GeomAbs_Cylinder:
+                cylinder = surface.Cylinder()
+                axis = cylinder.Axis().Direction()
+                radius = cylinder.Radius()
+                
+                cylindrical_surfaces.append({
+                    'axis': (axis.X(), axis.Y(), axis.Z()),
+                    'radius': radius
+                })
+            
+            face_explorer.Next()
+        
+        # Group by similar axis and find radius differences
+        if len(cylindrical_surfaces) >= 2:
+            radii = sorted(set(round(s['radius'], 1) for s in cylindrical_surfaces))
+            
+            if len(radii) >= 2:
+                # Approximate groove from radius differences
+                inner_radius = radii[0]
+                outer_radius = radii[-1]
+                
+                if outer_radius - inner_radius > 1.0:  # Significant difference
+                    grooves.append({
+                        'type': 'groove',
+                        'inner_diameter_mm': round(inner_radius * 2, 2),
+                        'outer_diameter_mm': round(outer_radius * 2, 2),
+                        'depth_mm': round((outer_radius - inner_radius), 2),
+                        'location': 'external',
+                        'orientation': 'Radial'
+                    })
+    
+    except Exception as e:
+        logger.error(f"Error detecting grooves: {e}")
+    
+    return grooves
+
+def detect_flat_surfaces_detailed(shape):
+    """Detect flat surfaces with dimensions"""
+    flats = []
+    
+    try:
+        face_explorer = TopExp_Explorer(shape, TopAbs_FACE)
+        
+        while face_explorer.More():
+            face = face_explorer.Current()
+            surface = BRepAdaptor_Surface(face)
+            
+            if surface.GetType() == GeomAbs_Plane:
+                # Get plane normal
+                plane = surface.Plane()
+                normal = plane.Axis().Direction()
+                
+                # Classify orientation
+                abs_normal = tuple(abs(n) for n in [normal.X(), normal.Y(), normal.Z()])
+                max_comp = max(abs_normal)
+                
+                if abs(abs_normal[2] - max_comp) < 0.1:
+                    orientation = 'Top' if normal.Z() > 0 else 'Bottom'
+                elif abs(abs_normal[0] - max_comp) < 0.1:
+                    orientation = 'Side-X'
+                else:
+                    orientation = 'Side-Y'
+                
+                # Approximate area (would need more complex calculation for exact area)
+                flats.append({
+                    'type': 'flat',
+                    'orientation': orientation,
+                    'area_mm2': 100.0,  # Placeholder
+                    'width_mm': 10.0,   # Placeholder
+                    'length_mm': 10.0   # Placeholder
+                })
+            
+            face_explorer.Next()
+    
+    except Exception as e:
+        logger.error(f"Error detecting flat surfaces: {e}")
+    
+    return flats[:5]  # Limit to top 5 flats
+
+def calculate_principal_dimensions(shape, bbox, is_cylindrical):
+    """Calculate primary dimensions of the part"""
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox
+    
+    width = xmax - xmin
+    height = ymax - ymin
+    depth = zmax - zmin
+    
+    dims = {
+        'length_mm': round(depth, 2),
+        'primary_axis': 'Z'
+    }
+    
     if is_cylindrical:
-        if largest_dim < 500:
-            routings.append("CNC Lathe")
-            reasons.append("Cylindrical geometry <500mm — CNC lathe preferred.")
-        else:
-            routings.append("Boring Mill")
-            reasons.append("Large cylindrical part — boring mill required.")
-        if holes > 0:
-            routings.append("VMC Machining")
-            reasons.append(f"{holes} hole(s) detected — secondary drilling on VMC.")
-        if grooves > 0:
-            routings.append("Keyway Machine")
-            reasons.append(f"{grooves} groove(s) — keyway slotting required.")
+        # For cylindrical parts, identify major diameter
+        dims['major_diameter_mm'] = round(max(width, height), 2)
+        dims['length_mm'] = round(depth, 2)
+    else:
+        # For prismatic parts
+        dims['width_mm'] = round(width, 2)
+        dims['height_mm'] = round(height, 2)
+        dims['depth_mm'] = round(depth, 2)
+    
+    return dims
 
-    # Prismatic parts
-    elif has_flats:
-        if largest_dim < 1000:
-            routings.append("VMC Machining")
-            reasons.append("Prismatic geometry <1m — VMC suitable.")
-        else:
-            routings.append("Boring Mill")
-            reasons.append("Large prismatic part — boring mill.")
-        if holes > 0:
-            routings.append("VMC Machining")
-            reasons.append(f"{holes} hole(s) — drilling cycle on VMC.")
-        if complexity >= 8:
-            routings.append("Wire EDM")
-            reasons.append("Complex geometry — Wire EDM for internal features.")
-
-    # Material modifiers
-    mat = material.lower()
-    if any(m in mat for m in ["stainless", "hardened", "tool steel"]):
-        routings.append("Wire EDM")
-        reasons.append("Hard material — EDM required for precision.")
-    if "aluminum" in mat:
-        reasons.append("Aluminum — high-speed cutting suitable.")
-    if "brass" in mat or "copper" in mat:
-        reasons.append("Excellent machinability — faster feeds.")
-
-    # Tolerance adjustments
-    if tolerance < 0.01:
-        routings.append("Wire EDM")
-        reasons.append(f"Tight tolerance ±{tolerance}mm — EDM finishing.")
-    elif tolerance < 0.02:
-        reasons.append(f"Tolerance ±{tolerance}mm — fine finishing required.")
-
-    if not routings:
-        routings.append("VMC Machining")
-        reasons.append("General machining fallback — VMC selected.")
-
-    ordered = []
-    [ordered.append(r) for r in routings if r not in ordered]
-    return {"recommended_routings": ordered, "reasoning": reasons}
-
-
-# =============================
-# MACHINING ESTIMATION MODULE
-# =============================
-
-MRR_BY_PROCESS = {"VMC Machining": 15, "CNC Lathe": 20, "Boring Mill": 10, "Keyway Machine": 5, "Wire EDM": 0.8}
-RATE_BY_PROCESS = {"VMC Machining": 80, "CNC Lathe": 75, "Boring Mill": 90, "Keyway Machine": 70, "Wire EDM": 120}
-MATERIAL_FACTORS = {
-    "aluminum": 0.8, "aluminium": 0.8, "brass": 0.9, "copper": 1.0,
-    "mild steel": 1.0, "cold rolled steel": 1.1, "stainless": 1.3,
-    "tool steel": 1.4, "hardened": 1.5, "titanium": 1.6
-}
-
-def estimate_machining_time_and_cost(desc, material, routings):
-    """Estimate machining time (minutes) and cost ($USD)"""
-    volume = desc.get("volume_cm3", 0)
-    complexity = desc.get("complexity_score", 5)
-    grooves = desc.get("grooves_count", 0)
-    bbox = desc.get("bounding_box", [0, 0, 0])
-    largest_dim = max(bbox) if bbox else 0
-    mat_factor = 1.0
-    for k, v in MATERIAL_FACTORS.items():
-        if k in material.lower():
-            mat_factor = v
-            break
-    complexity_factor = 1 + (complexity - 5) * 0.05
-
-    total_cost, estimates = 0, []
-    for r in routings:
-        mrr = MRR_BY_PROCESS.get(r, 10)
-        rate = RATE_BY_PROCESS.get(r, 75)
-        if r == "Wire EDM":
-            perimeter_cm = (bbox[0] + bbox[1]) / 10
-            time_min = (perimeter_cm * 10) * mat_factor
-        elif r == "Keyway Machine":
-            time_min = (grooves * 15) * mat_factor
-        else:
-            time_min = (volume / mrr) * mat_factor * complexity_factor
-
-        setup = 20 if largest_dim > 500 else 10
-        total_time = time_min + setup
-        cost = (total_time / 60) * rate
-        total_cost += cost
-
-        estimates.append({
-            "routing": r,
-            "machining_time_min": round(total_time, 2),
-            "machining_cost_usd": round(cost, 2)
+def buildFeatureTree(holes, grooves, flat_surfaces, primary_dims, is_cylindrical, width_mm, height_mm, depth_mm):
+    """
+    Build a hierarchical feature tree from detected features
+    
+    Returns a structured tree with:
+    - common_dimensions: Overall part dimensions
+    - oriented_sections: Features grouped by orientation
+    """
+    feature_tree = {
+        'common_dimensions': {},
+        'oriented_sections': []
+    }
+    
+    # Common dimensions
+    if is_cylindrical:
+        diameter = primary_dims.get('major_diameter_mm', max(width_mm, height_mm))
+        length = primary_dims.get('length_mm', depth_mm)
+        feature_tree['common_dimensions'] = {
+            'type': 'cylindrical',
+            'diameter_mm': round(diameter, 2),
+            'length_mm': round(length, 2)
+        }
+    else:
+        feature_tree['common_dimensions'] = {
+            'type': 'prismatic',
+            'width_mm': round(width_mm, 2),
+            'height_mm': round(height_mm, 2),
+            'depth_mm': round(depth_mm, 2)
+        }
+    
+    # Group features by orientation
+    sections = {}
+    
+    # Add holes to sections
+    for hole in holes:
+        orientation = hole.get('orientation', 'Unknown')
+        if orientation not in sections:
+            sections[orientation] = {
+                'orientation': orientation,
+                'features': []
+            }
+        sections[orientation]['features'].append({
+            'type': 'hole',
+            'diameter_mm': hole.get('diameter_mm'),
+            'depth_mm': hole.get('depth_mm'),
+            'through': hole.get('through', False)
         })
-
-    return {"machining_summary": estimates, "total_cost_usd": round(total_cost, 2)}
-
-
-# =============================
-# MESH GENERATION HELPERS
-# =============================
+    
+    # Add grooves to sections
+    for groove in grooves:
+        orientation = groove.get('orientation', 'Radial')
+        if orientation not in sections:
+            sections[orientation] = {
+                'orientation': orientation,
+                'features': []
+            }
+        sections[orientation]['features'].append({
+            'type': 'groove',
+            'inner_diameter_mm': groove.get('inner_diameter_mm'),
+            'outer_diameter_mm': groove.get('outer_diameter_mm'),
+            'depth_mm': groove.get('depth_mm')
+        })
+    
+    # Add flat surfaces to sections
+    for flat in flat_surfaces:
+        orientation = flat.get('orientation', 'Unknown')
+        if orientation not in sections:
+            sections[orientation] = {
+                'orientation': orientation,
+                'features': []
+            }
+        sections[orientation]['features'].append({
+            'type': 'flat_surface',
+            'area_mm2': flat.get('area_mm2'),
+            'width_mm': flat.get('width_mm'),
+            'length_mm': flat.get('length_mm')
+        })
+    
+    # Convert sections dict to list
+    feature_tree['oriented_sections'] = list(sections.values())
+    
+    return feature_tree
 
 def calculate_face_center(triangulation, transform):
     """Calculate centroid of face"""
@@ -173,6 +550,7 @@ def calculate_face_center(triangulation, transform):
 
 def get_average_face_normal(triangulation, transform, face_reversed):
     """Calculate average normal of face"""
+    # Use first triangle's normal as representative
     triangle = triangulation.Triangle(1)
     n1, n2, n3 = triangle.Get()
     
@@ -184,6 +562,7 @@ def get_average_face_normal(triangulation, transform, face_reversed):
     p2.Transform(transform)
     p3.Transform(transform)
     
+    # Cross product for normal
     edge1 = [p2.X()-p1.X(), p2.Y()-p1.Y(), p2.Z()-p1.Z()]
     edge2 = [p3.X()-p1.X(), p3.Y()-p1.Y(), p3.Z()-p1.Z()]
     
@@ -193,6 +572,7 @@ def get_average_face_normal(triangulation, transform, face_reversed):
         edge1[0]*edge2[1] - edge1[1]*edge2[0]
     ]
     
+    # Normalize and reverse if needed
     length = math.sqrt(sum(n*n for n in normal))
     if length > 0:
         normal = [n/length for n in normal]
@@ -210,14 +590,26 @@ def tessellate_shape(shape, quality=0.5):
         quality: 0-1 value, higher = finer mesh (more triangles, slower)
     
     Returns:
-        dict with vertices, indices, normals arrays + face classifications for rendering
+        dict with vertices, indices, normals arrays + face classifications for Meviy-style rendering
     """
     try:
         # Quality controls deflection (lower deflection = finer mesh)
-        deflection = 1.1 - quality  # Map to 0.01-0.6mm range
-        angular_deflection = 0.2  # ~11.5 degrees
+        # quality=0.5   -> 0.6mm deflection (coarse, fast preview)
+        # quality=0.85  -> 0.25mm deflection (good for external features)
+        # quality=0.95  -> 0.15mm deflection (captures internal fillets & small radii)
+        # quality=0.98  -> 0.12mm deflection (very high detail for complex internals)
+        # quality=0.995 -> 0.105mm deflection (professional CAD quality)
+        # quality=0.999 -> 0.011mm deflection (maximum quality, smooth internals - default)
+        # quality=1.0   -> 0.01mm deflection (absolute maximum)
+        deflection = 1.1 - quality  # Map to 0.01-0.6mm range (inverted: higher quality = lower deflection)
         
-        logger.info(f"Tessellating shape with quality={quality} (deflection={deflection}mm)")
+        # Angular deflection for smooth curves (radians)
+        # Lower values = smoother curves, more triangles on curved surfaces
+        angular_deflection = 0.2  # ~11.5 degrees - balances quality and performance
+        
+        # Create incremental mesh with adaptive tessellation
+        # Parameters: shape, linear_deflection, is_relative, angular_deflection, is_parallel
+        logger.info(f"Tessellating shape with quality={quality} (deflection={deflection}mm, angular={angular_deflection} rad)")
         mesh = BRepMesh_IncrementalMesh(shape, deflection, False, angular_deflection, True)
         mesh.Perform()
         
@@ -233,13 +625,15 @@ def tessellate_shape(shape, quality=0.5):
         center_z = (zmin + zmax) / 2
         max_radius = max(xmax - xmin, ymax - ymin, zmax - zmin) / 2
         
+        # Extract triangulated geometry with face classification
         vertices = []
         indices = []
         normals = []
-        face_types = []
-        vertex_map = {}
+        face_types = []  # 'external', 'internal', 'cylindrical', 'planar'
+        vertex_map = {}  # Map vertex coords to index
         current_index = 0
         
+        # Iterate through all faces
         face_explorer = TopExp_Explorer(shape, TopAbs_FACE)
         
         while face_explorer.More():
@@ -251,13 +645,18 @@ def tessellate_shape(shape, quality=0.5):
                 face_explorer.Next()
                 continue
             
+            # Get transformation
             transform = location.Transformation()
+            
+            # Get face properties for classification
             surface = BRepAdaptor_Surface(face)
-            face_reversed = face.Orientation() == 1
+            face_reversed = face.Orientation() == 1  # TopAbs_REVERSED
             surface_type = surface.GetType()
             
-            # Classify face type for color coding
-            face_classification = 'external'
+            # Classify face type for Meviy-style color coding with normal-based detection
+            face_classification = 'external'  # Default
+            
+            # Calculate face center and normal direction
             face_center = calculate_face_center(triangulation, transform)
             vector_to_center = [
                 center_x - face_center[0],
@@ -265,32 +664,44 @@ def tessellate_shape(shape, quality=0.5):
                 center_z - face_center[2]
             ]
             normal_vec = get_average_face_normal(triangulation, transform, face_reversed)
+            
+            # Dot product: positive = facing inward (internal), negative = facing outward
             dot_product = sum(n * v for n, v in zip(normal_vec, vector_to_center))
             
             if surface_type == GeomAbs_Cylinder:
+                # Cylindrical surface
                 cylinder = surface.Cylinder()
                 cyl_radius = cylinder.Radius()
+                
+                # Internal if: small radius OR normal pointing inward
                 if cyl_radius < max_radius * 0.4 or dot_product > 0.3:
-                    face_classification = 'internal'
+                    face_classification = 'internal'  # Internal cylindrical feature (hole)
                 else:
-                    face_classification = 'cylindrical'
+                    face_classification = 'cylindrical'  # External cylindrical feature
+                    
             elif surface_type == GeomAbs_Plane:
+                # Planar surface - check if internal based on normal direction
                 if dot_product > 0.5:
                     face_classification = 'internal'
                 else:
                     face_classification = 'planar'
             else:
+                # Other surface types (BSpline, fillets, etc.) - check if internal based on normal
                 if dot_product > 0.3:
                     face_classification = 'internal'
                 else:
                     face_classification = 'external'
             
+            # Build local vertex map for this face
+            face_vertex_start = current_index
             face_vertices = []
             
             # Extract vertices
             for i in range(1, triangulation.NbNodes() + 1):
                 pnt = triangulation.Node(i)
+                # Apply transformation
                 pnt.Transform(transform)
+                
                 coord = (round(pnt.X(), 6), round(pnt.Y(), 6), round(pnt.Z(), 6))
                 
                 if coord not in vertex_map:
@@ -306,10 +717,12 @@ def tessellate_shape(shape, quality=0.5):
                 triangle = triangulation.Triangle(i)
                 n1, n2, n3 = triangle.Get()
                 
+                # Map to global indices
                 idx1 = face_vertices[n1 - 1]
                 idx2 = face_vertices[n2 - 1]
                 idx3 = face_vertices[n3 - 1]
                 
+                # Reverse winding if face is reversed
                 if face_reversed:
                     indices.extend([idx1, idx3, idx2])
                 else:
@@ -323,19 +736,23 @@ def tessellate_shape(shape, quality=0.5):
                 edge1 = [v2[i] - v1[i] for i in range(3)]
                 edge2 = [v3[i] - v1[i] for i in range(3)]
                 
+                # Cross product
                 normal = [
                     edge1[1] * edge2[2] - edge1[2] * edge2[1],
                     edge1[2] * edge2[0] - edge1[0] * edge2[2],
                     edge1[0] * edge2[1] - edge1[1] * edge2[0]
                 ]
                 
+                # Normalize
                 length = math.sqrt(sum(n*n for n in normal))
                 if length > 0:
                     normal = [n / length for n in normal]
                 
+                # Reverse normal if face is reversed
                 if face_reversed:
                     normal = [-n for n in normal]
                 
+                # Add normal for each vertex of triangle
                 for _ in range(3):
                     normals.extend(normal)
                     face_types.append(face_classification)
@@ -343,18 +760,20 @@ def tessellate_shape(shape, quality=0.5):
             face_explorer.Next()
         
         triangle_count = len(indices) // 3
-        logger.info(f"Tessellation complete: {len(vertices)//3} vertices, {triangle_count} triangles")
+        
+        logger.info(f"Tessellation complete: {len(vertices)//3} vertices, {triangle_count} triangles, classified faces")
         
         return {
             'vertices': vertices,
             'indices': indices,
             'normals': normals,
-            'face_types': face_types,
+            'face_types': face_types,  # Face classification for each vertex
             'triangle_count': triangle_count
         }
         
     except Exception as e:
         logger.error(f"Error tessellating shape: {e}")
+        # Return minimal mesh on error
         return {
             'vertices': [],
             'indices': [],
@@ -362,125 +781,5 @@ def tessellate_shape(shape, quality=0.5):
             'triangle_count': 0
         }
 
-
-# =============================
-# MAIN CAD ANALYSIS ENDPOINT
-# =============================
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "service": "industrial-cad-analyzer"}), 200
-
-@app.route("/analyze-cad", methods=["POST"])
-def analyze_cad():
-    """Main endpoint: CAD upload → geometry + mesh + routing + cost"""
-    if "file" not in request.files:
-        return jsonify({"error": "No CAD file provided"}), 400
-
-    file = request.files["file"]
-    if not file.filename:
-        return jsonify({"error": "Empty filename"}), 400
-
-    material = request.form.get("material", "Cold Rolled Steel")
-    tolerance = float(request.form.get("tolerance", 0.02))
-    quality = float(request.form.get("quality", 0.999))
-    
-    logger.info(f"Analyzing: {file.filename}, material={material}, tol={tolerance}mm, quality={quality}")
-
-    # Save file temporarily
-    ext = os.path.splitext(file.filename)[1].lower()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        file.save(tmp.name)
-        tmp_path = tmp.name
-
-    try:
-        reader = STEPControl_Reader()
-        if reader.ReadFile(tmp_path) != 1:
-            raise Exception("Failed to read STEP/IGES file.")
-        reader.TransferRoots()
-        shape = reader.OneShape()
-        if shape.IsNull():
-            raise Exception("Invalid or empty CAD geometry.")
-
-        # Volume, surface, bbox
-        props = GProp_GProps()
-        brepgprop.VolumeProperties(shape, props)
-        volume_mm3 = props.Mass()
-        brepgprop.SurfaceProperties(shape, props)
-        surf_area = props.Mass()
-        bbox = Bnd_Box()
-        brepbndlib.Add(shape, bbox)
-        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-        width, height, depth = xmax - xmin, ymax - ymin, zmax - zmin
-
-        # Surface classification
-        cyl_faces, planar_faces, total_faces = 0, 0, 0
-        explorer = TopExp_Explorer(shape, TopAbs_FACE)
-        while explorer.More():
-            s = BRepAdaptor_Surface(explorer.Current())
-            if s.GetType() == GeomAbs_Cylinder:
-                cyl_faces += 1
-            elif s.GetType() == GeomAbs_Plane:
-                planar_faces += 1
-            total_faces += 1
-            explorer.Next()
-
-        is_cylindrical = cyl_faces > total_faces * 0.4 if total_faces else False
-        has_flat = planar_faces > 2
-        complexity = min(10, max(1, int(total_faces / 10) + 3))
-
-        # Generate mesh data for 3D preview
-        mesh_data = tessellate_shape(shape, quality)
-
-        # Build geometry descriptor
-        desc = {
-            "bounding_box": [round(width,2), round(height,2), round(depth,2)],
-            "volume_cm3": round(volume_mm3 / 1000, 2),
-            "is_cylindrical": is_cylindrical,
-            "has_flat_surfaces": has_flat,
-            "holes_count": 0,  # Simplified for merged version
-            "grooves_count": 0,  # Simplified for merged version
-            "complexity_score": complexity,
-            "tolerance": tolerance
-        }
-
-        # Routing selection + cost estimation
-        routing_result = select_routings_industrial(desc, material)
-        machining_est = estimate_machining_time_and_cost(desc, material, routing_result["recommended_routings"])
-
-        # Build complete result with mesh data
-        result = {
-            "volume_cm3": desc["volume_cm3"],
-            "surface_area_cm2": round(surf_area / 100, 2),
-            "part_width_cm": round(width / 10, 2),
-            "part_height_cm": round(height / 10, 2),
-            "part_depth_cm": round(depth / 10, 2),
-            "complexity_score": complexity,
-            "is_cylindrical": is_cylindrical,
-            "has_flat_surfaces": has_flat,
-            "cylindrical_faces": cyl_faces,
-            "planar_faces": planar_faces,
-            "total_faces": total_faces,
-            "confidence": 0.95,
-            "method": "pythonOCC_geometry_parsing",
-            "mesh_data": mesh_data,  # ← THIS IS THE KEY FOR 3D PREVIEW
-            "recommended_routings": routing_result["recommended_routings"],
-            "routing_reasoning": routing_result["reasoning"],
-            "machining_summary": machining_est["machining_summary"],
-            "estimated_total_cost_usd": machining_est["total_cost_usd"]
-        }
-
-        logger.info(f"Analysis complete: {len(mesh_data.get('vertices', []))//3} vertices, routings={routing_result['recommended_routings']}, cost=${machining_est['total_cost_usd']}")
-        return jsonify(result), 200
-
-    except Exception as e:
-        logger.error(f"CAD analysis failed: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
-
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=False)
