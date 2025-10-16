@@ -5,9 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 COPY app.py .
 
-# Install system deps for pythonocc-core
+# Install system dependencies for pythonocc-core (Debian 13+ compatible)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx libglu1-mesa libxrender1 libxext6 libsm6 && \
+    libgl1 libglu1-mesa libxrender1 libxext6 libsm6 && \
     rm -rf /var/lib/apt/lists/*
 
 # Install everything with pip (lighter than conda)
