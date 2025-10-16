@@ -6,6 +6,7 @@ Vectis Manufacturing - CAD Geometry Analysis Microservice (Render 512MB Safe Mod
 - Selects machining routing and estimates cost
 - Tessellates geometry safely within Render memory limits
 - Adds robust BRep feature-edge extraction and simplification
+- ✅ Now returns feature_edges in the JSON response for the viewer
 """
 
 from flask import Flask, request, jsonify
@@ -84,26 +85,12 @@ def estimate_machining_time_and_cost(geometry_descriptor, material, routings):
 # --- Feature Edge Extraction + Simplification ---
 # -------------------------------------------------------------------------
 def extract_feature_edges(shape, n_points=20, angle_tol_deg=3.0, merge_dist=0.05):
-    """
-    Extracts true BRep edges from the STEP shape and simplifies nearly-collinear segments.
-    Compatible with both 2- and 3-return-value OCC builds.
-    """
     edges = []
-    stats = {
-        "Line": 0,
-        "Circle": 0,
-        "Ellipse": 0,
-        "BSpline": 0,
-        "Bezier": 0,
-        "Other": 0,
-    }
-
+    stats = {"Line": 0, "Circle": 0, "Ellipse": 0, "BSpline": 0, "Bezier": 0, "Other": 0}
     try:
         exp = TopExp_Explorer(shape, TopAbs_EDGE)
         while exp.More():
             edge = exp.Current()
-
-            # --- Handle curve extraction safely ---
             try:
                 curve_data = BRep_Tool.Curve(edge)
                 if len(curve_data) == 3:
@@ -121,7 +108,6 @@ def extract_feature_edges(shape, n_points=20, angle_tol_deg=3.0, merge_dist=0.05
                 exp.Next()
                 continue
 
-            # --- Identify curve type ---
             curve_adapter = BRepAdaptor_Curve(edge)
             curve_type = curve_adapter.GetType()
             if curve_type == GeomAbs_Line:
@@ -143,7 +129,6 @@ def extract_feature_edges(shape, n_points=20, angle_tol_deg=3.0, merge_dist=0.05
                 stats["Other"] += 1
                 num_samples = 10
 
-            # --- Sample the curve into 3D points ---
             pts = []
             for t in np.linspace(first, last, num_samples):
                 try:
@@ -156,24 +141,20 @@ def extract_feature_edges(shape, n_points=20, angle_tol_deg=3.0, merge_dist=0.05
             if len(pts) >= 2:
                 simplified = simplify_polyline(pts, angle_tol_deg, merge_dist)
                 edges.append(simplified)
-
             exp.Next()
 
-        total = len(edges)
         logger.info(
-            f"Extracted {total} feature edges "
+            f"Extracted {len(edges)} feature edges "
             f"(Lines={stats['Line']}, Circles={stats['Circle']}, "
             f"Splines={stats['BSpline']}, Ellipses={stats['Ellipse']}, "
             f"Bezier={stats['Bezier']}, Other={stats['Other']})"
         )
-
     except Exception as e:
         logger.warning(f"Feature edge extraction failed: {e}")
     return edges
 
 
 def simplify_polyline(points, angle_tol_deg=3.0, merge_dist=0.05):
-    """Simplifies a polyline by removing nearly collinear points and short segments."""
     if len(points) <= 2:
         return points
     simplified = [points[0]]
@@ -181,14 +162,10 @@ def simplify_polyline(points, angle_tol_deg=3.0, merge_dist=0.05):
         p_prev = np.array(simplified[-1])
         p_curr = np.array(points[i])
         p_next = np.array(points[i + 1])
-
-        v1 = p_curr - p_prev
-        v2 = p_next - p_curr
-        norm1 = np.linalg.norm(v1)
-        norm2 = np.linalg.norm(v2)
+        v1, v2 = p_curr - p_prev, p_next - p_curr
+        norm1, norm2 = np.linalg.norm(v1), np.linalg.norm(v2)
         if norm1 < merge_dist or norm2 < merge_dist:
             continue
-
         dot = np.clip(np.dot(v1, v2) / (norm1 * norm2), -1.0, 1.0)
         ang = math.degrees(math.acos(dot))
         if ang > angle_tol_deg:
@@ -210,7 +187,6 @@ def analyze_cad():
     if not file.filename:
         return jsonify({"error": "Empty filename"}), 400
 
-    # --- File size guard for 512MB RAM ---
     file.seek(0, os.SEEK_END)
     file_size = file.tell()
     file.seek(0)
@@ -245,7 +221,6 @@ def analyze_cad():
         xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
         width, height, depth = xmax - xmin, ymax - ymin, zmax - zmin
 
-        # --- Face analysis ---
         cyl_faces = plan_faces = total_faces = 0
         exp = TopExp_Explorer(shape, TopAbs_FACE)
         while exp.More():
@@ -276,6 +251,7 @@ def analyze_cad():
         routing = select_routings_industrial(geom, material)
         estimate = estimate_machining_time_and_cost(geom, material, routing["recommended_routings"])
 
+        # ✅ Include feature_edges directly in the returned JSON
         result = {
             "volume_cm3": geom["volume_cm3"],
             "surface_area_cm2": round(area_mm2 / 100, 2),
@@ -288,13 +264,16 @@ def analyze_cad():
             "cylindrical_faces": cyl_faces,
             "total_faces": total_faces,
             "mesh_data": mesh,
-            "feature_edges": feature_edges,
+            "feature_edges": feature_edges,   # ✅ Added here
             "recommended_routings": routing["recommended_routings"],
             "routing_reasoning": routing["reasoning"],
             "machining_summary": estimate["machining_summary"],
             "estimated_total_cost_usd": estimate["total_cost_usd"],
         }
+
+        logger.info(f"Returning {len(feature_edges)} feature edges to frontend")
         return jsonify(result), 200
+
     except Exception as e:
         logger.error(f"Error analyzing file: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
@@ -304,8 +283,6 @@ def analyze_cad():
         except:
             pass
 
-# -------------------------------------------------------------------------
-# Tessellation (Render 512MB Safe Mode)
 # -------------------------------------------------------------------------
 def tessellate_shape(shape, quality=0.999, geometry_descriptor=None):
     try:
