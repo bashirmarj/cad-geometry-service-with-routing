@@ -218,7 +218,7 @@ def tessellate_shape(shape, quality=0.5):
 # === STEP file upload endpoint ===
 # --------------------------------------------------
 
-@app.route("/upload", methods=["POST"])
+@app.route("/analyze-cad", methods=["POST"])
 def analyze_cad():
     """Upload a STEP file, mesh it, store in Supabase, return data"""
     try:
