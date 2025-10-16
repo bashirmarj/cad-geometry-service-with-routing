@@ -4,8 +4,8 @@ Vectis Manufacturing - CAD Geometry Analysis Microservice (Render 512MB Safe Mod
 - Parses STEP files using pythonOCC
 - Extracts volume, area, faces, and complexity
 - Selects machining routing and estimates cost
-- Tessellates geometry safely within 512 MB container limits
-- Adds feature edge extraction for clean CAD wireframe visualization
+- Tessellates geometry safely within Render memory limits
+- Adds robust BRep feature-edge extraction and simplification
 """
 
 from flask import Flask, request, jsonify
@@ -18,8 +18,16 @@ from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.GProp import GProp_GProps
 from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.Bnd import Bnd_Box
-from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
-from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Plane
+from OCC.Core.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
+from OCC.Core.GeomAbs import (
+    GeomAbs_Cylinder,
+    GeomAbs_Plane,
+    GeomAbs_Line,
+    GeomAbs_Circle,
+    GeomAbs_Ellipse,
+    GeomAbs_BSplineCurve,
+    GeomAbs_BezierCurve,
+)
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
 from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
@@ -39,7 +47,6 @@ logger = logging.getLogger(__name__)
 # INLINE ROUTING + COST LOGIC
 # -------------------------------------------------------------------------
 def select_routings_industrial(geometry_descriptor, material):
-    """Select machining routing based on geometry shape and complexity."""
     is_cyl = geometry_descriptor.get("is_cylindrical", False)
     comp = geometry_descriptor.get("complexity_score", 5)
     holes = geometry_descriptor.get("holes_count", 0)
@@ -59,7 +66,6 @@ def select_routings_industrial(geometry_descriptor, material):
 
 
 def estimate_machining_time_and_cost(geometry_descriptor, material, routings):
-    """Estimate machining time and cost."""
     base_rate = 60.0  # USD/hr
     vol = geometry_descriptor.get("volume_cm3", 0)
     comp = geometry_descriptor.get("complexity_score", 5)
@@ -75,31 +81,120 @@ def estimate_machining_time_and_cost(geometry_descriptor, material, routings):
     return {"machining_summary": summary, "total_cost_usd": round(cost, 2)}
 
 # -------------------------------------------------------------------------
-# --- Feature Edge Extraction ---
+# --- Feature Edge Extraction + Simplification ---
 # -------------------------------------------------------------------------
-def extract_feature_edges(shape, n_points=20):
+def extract_feature_edges(shape, n_points=20, angle_tol_deg=3.0, merge_dist=0.05):
     """
-    Extracts true BRep edges (TopoDS_Edge) from the STEP shape.
-    Each edge is sampled into n_points along the curve.
+    Extracts true BRep edges from the STEP shape and simplifies nearly-collinear segments.
+    Compatible with both 2- and 3-return-value OCC builds.
     """
     edges = []
+    stats = {
+        "Line": 0,
+        "Circle": 0,
+        "Ellipse": 0,
+        "BSpline": 0,
+        "Bezier": 0,
+        "Other": 0,
+    }
+
     try:
         exp = TopExp_Explorer(shape, TopAbs_EDGE)
         while exp.More():
             edge = exp.Current()
-            curve_handle, first, last = BRep_Tool.Curve(edge)
-            if curve_handle:
-                pts = []
-                for t in np.linspace(first, last, n_points):
+
+            # --- Handle curve extraction safely ---
+            try:
+                curve_data = BRep_Tool.Curve(edge)
+                if len(curve_data) == 3:
+                    curve_handle, first, last = curve_data
+                elif len(curve_data) == 2:
+                    curve_handle, (first, last) = curve_data
+                else:
+                    exp.Next()
+                    continue
+            except Exception:
+                exp.Next()
+                continue
+
+            if not curve_handle:
+                exp.Next()
+                continue
+
+            # --- Identify curve type ---
+            curve_adapter = BRepAdaptor_Curve(edge)
+            curve_type = curve_adapter.GetType()
+            if curve_type == GeomAbs_Line:
+                stats["Line"] += 1
+                num_samples = 2
+            elif curve_type == GeomAbs_Circle:
+                stats["Circle"] += 1
+                num_samples = 16
+            elif curve_type == GeomAbs_Ellipse:
+                stats["Ellipse"] += 1
+                num_samples = 16
+            elif curve_type == GeomAbs_BSplineCurve:
+                stats["BSpline"] += 1
+                num_samples = 12
+            elif curve_type == GeomAbs_BezierCurve:
+                stats["Bezier"] += 1
+                num_samples = 12
+            else:
+                stats["Other"] += 1
+                num_samples = 10
+
+            # --- Sample the curve into 3D points ---
+            pts = []
+            for t in np.linspace(first, last, num_samples):
+                try:
                     p = gp_Pnt()
                     curve_handle.D0(t, p)
                     pts.append([p.X(), p.Y(), p.Z()])
-                edges.append(pts)
+                except Exception:
+                    continue
+
+            if len(pts) >= 2:
+                simplified = simplify_polyline(pts, angle_tol_deg, merge_dist)
+                edges.append(simplified)
+
             exp.Next()
-        logger.info(f"Extracted {len(edges)} feature edges")
+
+        total = len(edges)
+        logger.info(
+            f"Extracted {total} feature edges "
+            f"(Lines={stats['Line']}, Circles={stats['Circle']}, "
+            f"Splines={stats['BSpline']}, Ellipses={stats['Ellipse']}, "
+            f"Bezier={stats['Bezier']}, Other={stats['Other']})"
+        )
+
     except Exception as e:
         logger.warning(f"Feature edge extraction failed: {e}")
     return edges
+
+
+def simplify_polyline(points, angle_tol_deg=3.0, merge_dist=0.05):
+    """Simplifies a polyline by removing nearly collinear points and short segments."""
+    if len(points) <= 2:
+        return points
+    simplified = [points[0]]
+    for i in range(1, len(points) - 1):
+        p_prev = np.array(simplified[-1])
+        p_curr = np.array(points[i])
+        p_next = np.array(points[i + 1])
+
+        v1 = p_curr - p_prev
+        v2 = p_next - p_curr
+        norm1 = np.linalg.norm(v1)
+        norm2 = np.linalg.norm(v2)
+        if norm1 < merge_dist or norm2 < merge_dist:
+            continue
+
+        dot = np.clip(np.dot(v1, v2) / (norm1 * norm2), -1.0, 1.0)
+        ang = math.degrees(math.acos(dot))
+        if ang > angle_tol_deg:
+            simplified.append(points[i])
+    simplified.append(points[-1])
+    return simplified
 
 # -------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
@@ -120,7 +215,7 @@ def analyze_cad():
     file_size = file.tell()
     file.seek(0)
     if file_size > 25_000_000:
-        return jsonify({"error": "File too large for 512 MB Render plan"}), 400
+        return jsonify({"error": "File too large for Render plan"}), 400
 
     material = request.form.get("material", "Cold Rolled Steel")
     tolerance = float(request.form.get("tolerance", 0.02))
@@ -145,18 +240,21 @@ def analyze_cad():
         brepgprop.SurfaceProperties(shape, props)
         area_mm2 = props.Mass()
 
-        bbox = Bnd_Box(); brepbndlib.Add(shape, bbox)
+        bbox = Bnd_Box()
+        brepbndlib.Add(shape, bbox)
         xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
         width, height, depth = xmax - xmin, ymax - ymin, zmax - zmin
 
-        # --- Surface analysis ---
+        # --- Face analysis ---
         cyl_faces = plan_faces = total_faces = 0
         exp = TopExp_Explorer(shape, TopAbs_FACE)
         while exp.More():
             surf = BRepAdaptor_Surface(exp.Current())
             t = surf.GetType()
-            if t == GeomAbs_Cylinder: cyl_faces += 1
-            elif t == GeomAbs_Plane: plan_faces += 1
+            if t == GeomAbs_Cylinder:
+                cyl_faces += 1
+            elif t == GeomAbs_Plane:
+                plan_faces += 1
             total_faces += 1
             exp.Next()
         is_cyl = cyl_faces > total_faces * 0.4
@@ -172,13 +270,9 @@ def analyze_cad():
             "tolerance": tolerance,
         }
 
-        # --- Tessellate for shading view ---
         mesh = tessellate_shape(shape, quality, geom)
-
-        # --- Extract feature edges for clean wireframe view ---
         feature_edges = extract_feature_edges(shape)
 
-        # --- Routing & cost ---
         routing = select_routings_industrial(geom, material)
         estimate = estimate_machining_time_and_cost(geom, material, routing["recommended_routings"])
 
@@ -194,7 +288,7 @@ def analyze_cad():
             "cylindrical_faces": cyl_faces,
             "total_faces": total_faces,
             "mesh_data": mesh,
-            "feature_edges": feature_edges,  # <--- NEW CLEAN EDGES
+            "feature_edges": feature_edges,
             "recommended_routings": routing["recommended_routings"],
             "routing_reasoning": routing["reasoning"],
             "machining_summary": estimate["machining_summary"],
@@ -214,13 +308,12 @@ def analyze_cad():
 # Tessellation (Render 512MB Safe Mode)
 # -------------------------------------------------------------------------
 def tessellate_shape(shape, quality=0.999, geometry_descriptor=None):
-    """Safe tessellation tuned for low-memory Render environments."""
     try:
-        bbox = Bnd_Box(); brepbndlib.Add(shape, bbox)
+        bbox = Bnd_Box()
+        brepbndlib.Add(shape, bbox)
         xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
         size_mm = max(xmax - xmin, ymax - ymin, zmax - zmin)
 
-        # --- Safe Tessellation ---
         min_defl = 0.15
         max_defl = 1.0
         base_defl = 0.4 * (10 ** (-(quality * 2.5)))
@@ -235,7 +328,8 @@ def tessellate_shape(shape, quality=0.999, geometry_descriptor=None):
 
         mesh = BRepMesh_IncrementalMesh(shape, defl, False, ang_defl, True)
         mesh.Perform()
-        if not mesh.IsDone(): raise Exception("Mesh failed")
+        if not mesh.IsDone():
+            raise Exception("Mesh failed")
 
         verts, inds, vmap, vidx = [], [], {}, 0
         exp = TopExp_Explorer(shape, TopAbs_FACE)
