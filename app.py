@@ -5,11 +5,12 @@ Vectis Manufacturing - CAD Geometry Analysis Microservice (Render 512MB Safe Mod
 - Extracts volume, area, faces, and complexity
 - Selects machining routing and estimates cost
 - Tessellates geometry safely within 512 MB container limits
+- Adds feature edge extraction for clean CAD wireframe visualization
 """
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import tempfile, os, logging, math
+import tempfile, os, logging, math, numpy as np
 
 # --- pythonOCC imports ---
 from OCC.Core.STEPControl import STEPControl_Reader
@@ -20,10 +21,11 @@ from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
 from OCC.Core.GeomAbs import GeomAbs_Cylinder, GeomAbs_Plane
 from OCC.Core.TopExp import TopExp_Explorer
-from OCC.Core.TopAbs import TopAbs_FACE
+from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE
 from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
 from OCC.Core.TopLoc import TopLoc_Location
 from OCC.Core.BRep import BRep_Tool
+from OCC.Core.gp import gp_Pnt
 
 # -------------------------------------------------------------------------
 # Flask setup
@@ -73,9 +75,37 @@ def estimate_machining_time_and_cost(geometry_descriptor, material, routings):
     return {"machining_summary": summary, "total_cost_usd": round(cost, 2)}
 
 # -------------------------------------------------------------------------
+# --- Feature Edge Extraction ---
+# -------------------------------------------------------------------------
+def extract_feature_edges(shape, n_points=20):
+    """
+    Extracts true BRep edges (TopoDS_Edge) from the STEP shape.
+    Each edge is sampled into n_points along the curve.
+    """
+    edges = []
+    try:
+        exp = TopExp_Explorer(shape, TopAbs_EDGE)
+        while exp.More():
+            edge = exp.Current()
+            curve_handle, first, last = BRep_Tool.Curve(edge)
+            if curve_handle:
+                pts = []
+                for t in np.linspace(first, last, n_points):
+                    p = gp_Pnt()
+                    curve_handle.D0(t, p)
+                    pts.append([p.X(), p.Y(), p.Z()])
+                edges.append(pts)
+            exp.Next()
+        logger.info(f"Extracted {len(edges)} feature edges")
+    except Exception as e:
+        logger.warning(f"Feature edge extraction failed: {e}")
+    return edges
+
+# -------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "healthy"}), 200
+
 
 @app.route("/analyze-cad", methods=["POST"])
 def analyze_cad():
@@ -89,7 +119,7 @@ def analyze_cad():
     file.seek(0, os.SEEK_END)
     file_size = file.tell()
     file.seek(0)
-    if file_size > 25_000_000:  # 25 MB
+    if file_size > 25_000_000:
         return jsonify({"error": "File too large for 512 MB Render plan"}), 400
 
     material = request.form.get("material", "Cold Rolled Steel")
@@ -142,7 +172,13 @@ def analyze_cad():
             "tolerance": tolerance,
         }
 
+        # --- Tessellate for shading view ---
         mesh = tessellate_shape(shape, quality, geom)
+
+        # --- Extract feature edges for clean wireframe view ---
+        feature_edges = extract_feature_edges(shape)
+
+        # --- Routing & cost ---
         routing = select_routings_industrial(geom, material)
         estimate = estimate_machining_time_and_cost(geom, material, routing["recommended_routings"])
 
@@ -158,6 +194,7 @@ def analyze_cad():
             "cylindrical_faces": cyl_faces,
             "total_faces": total_faces,
             "mesh_data": mesh,
+            "feature_edges": feature_edges,  # <--- NEW CLEAN EDGES
             "recommended_routings": routing["recommended_routings"],
             "routing_reasoning": routing["reasoning"],
             "machining_summary": estimate["machining_summary"],
@@ -168,8 +205,10 @@ def analyze_cad():
         logger.error(f"Error analyzing file: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
     finally:
-        try: os.unlink(tmp_path)
-        except: pass
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
 
 # -------------------------------------------------------------------------
 # Tessellation (Render 512MB Safe Mode)
@@ -181,8 +220,8 @@ def tessellate_shape(shape, quality=0.999, geometry_descriptor=None):
         xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
         size_mm = max(xmax - xmin, ymax - ymin, zmax - zmin)
 
-        # --- Render 512MB Safe Tessellation ---
-        min_defl = 0.15   # coarse floor
+        # --- Safe Tessellation ---
+        min_defl = 0.15
         max_defl = 1.0
         base_defl = 0.4 * (10 ** (-(quality * 2.5)))
         base_defl = min(max(base_defl, min_defl), max_defl)
@@ -190,7 +229,7 @@ def tessellate_shape(shape, quality=0.999, geometry_descriptor=None):
         comp = geometry_descriptor.get("complexity_score", 5) if geometry_descriptor else 5
         comp_factor = 1.0 + (comp / 20.0)
         defl = min(base_defl * comp_factor, max_defl)
-        ang_defl = 0.08  # ~4.5°
+        ang_defl = 0.08
 
         logger.info(f"[SAFE MODE] defl={defl:.3f}mm, ang={ang_defl:.3f}, size={size_mm:.1f}mm, comp={comp}")
 
@@ -204,21 +243,26 @@ def tessellate_shape(shape, quality=0.999, geometry_descriptor=None):
             face = exp.Current()
             loc = TopLoc_Location()
             tri = BRep_Tool.Triangulation(face, loc)
-            if tri is None: exp.Next(); continue
+            if tri is None:
+                exp.Next()
+                continue
             tr = loc.Transformation()
             rev = face.Orientation() == 1
             fverts = []
-            for i in range(1, tri.NbNodes()+1):
-                p = tri.Node(i); p.Transform(tr)
-                key = (round(p.X(),6), round(p.Y(),6), round(p.Z(),6))
+            for i in range(1, tri.NbNodes() + 1):
+                p = tri.Node(i)
+                p.Transform(tr)
+                key = (round(p.X(), 6), round(p.Y(), 6), round(p.Z(), 6))
                 if key not in vmap:
-                    verts.extend([p.X(),p.Y(),p.Z()])
-                    vmap[key] = vidx; vidx += 1
+                    verts.extend([p.X(), p.Y(), p.Z()])
+                    vmap[key] = vidx
+                    vidx += 1
                 fverts.append(vmap[key])
-            for i in range(1, tri.NbTriangles()+1):
-                t = tri.Triangle(i); n1,n2,n3 = t.Get()
-                a,b,c = fverts[n1-1], fverts[n2-1], fverts[n3-1]
-                inds.extend([a,c,b] if rev else [a,b,c])
+            for i in range(1, tri.NbTriangles() + 1):
+                t = tri.Triangle(i)
+                n1, n2, n3 = t.Get()
+                a, b, c = fverts[n1 - 1], fverts[n2 - 1], fverts[n3 - 1]
+                inds.extend([a, c, b] if rev else [a, b, c])
             exp.Next()
 
         logger.info(f"Mesh complete: {len(verts)//3} verts, {len(inds)//3} tris")
