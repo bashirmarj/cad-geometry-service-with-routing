@@ -11,7 +11,7 @@ COPY requirements.txt .
 # Install dependencies from conda and pip
 # - pythonocc-core must be installed via conda (not pip)
 # - gunicorn, flask, and flask-cors installed via pip for version consistency
-RRUN conda install -c conda-forge python=3.11 pythonocc-core numpy -y && \
+RUN conda install -c conda-forge python=3.11 pythonocc-core numpy -y && \
     pip install --no-cache-dir -r requirements.txt && \
     conda clean -afy
 
