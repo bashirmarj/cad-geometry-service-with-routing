@@ -4,4 +4,3 @@ gunicorn==21.2.0
 numpy==1.26.4
 supabase==2.4.6
 python-dotenv==1.0.1
-pythonocc-core==7.7.2
