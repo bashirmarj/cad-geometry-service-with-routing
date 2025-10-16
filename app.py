@@ -6,7 +6,7 @@ Vectis Manufacturing - CAD Geometry Analysis Microservice (Render 512MB Safe Mod
 - Selects machining routing and estimates cost
 - Tessellates geometry safely within Render memory limits
 - Adds robust BRep feature-edge extraction and simplification
-- ✅ Now returns feature_edges in the JSON response for the viewer
+- ✅ Now stores feature_edges in Supabase for Lovable CAD viewer
 """
 
 from flask import Flask, request, jsonify
@@ -35,6 +35,13 @@ from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
 from OCC.Core.TopLoc import TopLoc_Location
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.gp import gp_Pnt
+
+# --- Supabase client ---
+from supabase import create_client, Client
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 # -------------------------------------------------------------------------
 # Flask setup
@@ -251,7 +258,23 @@ def analyze_cad():
         routing = select_routings_industrial(geom, material)
         estimate = estimate_machining_time_and_cost(geom, material, routing["recommended_routings"])
 
-        # ✅ Include feature_edges directly in the returned JSON
+        # ✅ Save mesh and feature_edges to Supabase
+        if supabase:
+            try:
+                data_insert = {
+                    "file_name": file.filename,
+                    "vertices": mesh["vertices"],
+                    "indices": mesh["indices"],
+                    "normals": mesh["normals"],
+                    "triangle_count": len(mesh["indices"]) // 3,
+                    "feature_edges": feature_edges,
+                }
+                supabase.table("cad_meshes").insert(data_insert).execute()
+                logger.info(f"✅ Saved mesh + {len(feature_edges)} feature_edges to Supabase")
+            except Exception as e:
+                logger.warning(f"Could not save to Supabase: {e}")
+
+        # ✅ Include feature_edges directly in JSON response
         result = {
             "volume_cm3": geom["volume_cm3"],
             "surface_area_cm2": round(area_mm2 / 100, 2),
@@ -264,7 +287,7 @@ def analyze_cad():
             "cylindrical_faces": cyl_faces,
             "total_faces": total_faces,
             "mesh_data": mesh,
-            "feature_edges": feature_edges,   # ✅ Added here
+            "feature_edges": feature_edges,
             "recommended_routings": routing["recommended_routings"],
             "routing_reasoning": routing["reasoning"],
             "machining_summary": estimate["machining_summary"],
